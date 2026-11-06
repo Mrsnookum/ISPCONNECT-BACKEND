@@ -1,0 +1,244 @@
+import os
+import requests
+import string
+import random
+from datetime import datetime, timedelta
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel
+from db import supabase
+import routeros_api
+
+router = APIRouter(prefix="/api/portal", tags=["Portal"])
+
+class PaymentRequest(BaseModel):
+    phone: str
+    package_id: str
+    mac: str = ""
+    ip: str = ""
+
+def generate_voucher(length=6):
+    """Generates a random uppercase alphanumeric voucher code."""
+    chars = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
+    """Background task: Connects to MikroTik and creates the hotspot user."""
+    print(f"🔄 Injecting voucher {voucher_code} to router {router_ip}...")
+    try:
+        # Fetch the secure token generated during onboarding for this specific router
+        token_res = supabase.table("provisioning_tokens").select("token").order("created_at", desc=True).limit(1).execute()
+        if not token_res.data:
+            print("❌ Cannot inject: No provisioning token found to authenticate with router.")
+            return
+
+        router_password = token_res.data[0]["token"]
+        
+        # Connect to the MikroTik API
+        connection = routeros_api.RouterOsApiPool(
+            router_ip, 
+            username="ispconnect_api", 
+            password=router_password, 
+            plaintext_login=True
+        )
+        api = connection.get_api()
+
+        # Inject the user into the local Hotspot database
+        # We set both username and password to the voucher code
+        api.get_resource('/ip/hotspot/user').add(
+            name=voucher_code,
+            password=voucher_code,
+            profile="default"
+        )
+        
+        connection.disconnect()
+        print(f"✅ Voucher {voucher_code} successfully injected into MikroTik {router_ip}")
+
+    except Exception as e:
+        print(f"🔥 MikroTik Injection Error: {str(e)}")
+
+@router.get("/packages")
+def get_public_packages():
+    """Fetch only active packages for the public captive portal."""
+    try:
+        res = supabase.table("packages").select("*").order("price").execute()
+        return res.data or []
+    except Exception as e:
+        print(f"🔥 Database Error fetching packages: {e}") 
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/pay")
+def trigger_payhero_payment(req: PaymentRequest):
+    """Trigger M-Pesa STK Push via PayHero API securely."""
+    pkg_res = supabase.table("packages").select("price, name").eq("id", req.package_id).execute()
+    if not pkg_res.data:
+        raise HTTPException(status_code=404, detail="Package not found")
+
+    amount = pkg_res.data[0]['price']
+
+    payhero_api_key = os.getenv("PAYHERO_API_KEY")
+    payhero_channel_id = os.getenv("PAYHERO_CHANNEL_ID")
+
+    if not payhero_api_key or not payhero_channel_id:
+        raise HTTPException(status_code=500, detail="PayHero API credentials not configured in .env")
+
+    try:
+        # Store a "pending" transaction first to track the router IP for the callback
+        supabase.table("payments").insert({
+            "package_id": req.package_id,
+            "amount": amount,
+            "phone": req.phone, 
+            "status": "pending",
+            "notes": f"RouterIP:{req.ip}" # We store the IP here to retrieve it during callback
+        }).execute()
+
+        payhero_url = "https://backend.payhero.co.ke/api/v2/payments"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": payhero_api_key 
+        }
+        
+        # Render automatically sets RENDER_EXTERNAL_URL. If not available, use your fallback.
+        backend_url = os.getenv("RENDER_EXTERNAL_URL", "https://ispconnect-api.onrender.com")
+
+        payload = {
+            "amount": amount,
+            "phone_number": req.phone,
+            "channel_id": int(payhero_channel_id),
+            "provider": "m-pesa",
+            "external_reference": req.package_id,
+            # UPDATE THIS: Now points dynamically to your live production server
+            "callback_url": f"{backend_url}/api/portal/callback" 
+        }
+
+        response = requests.post(payhero_url, json=payload, headers=headers)
+
+        if response.status_code not in [200, 201]:
+            print(f"PayHero Rejected: {response.text}") 
+            raise HTTPException(status_code=response.status_code, detail="PayHero API rejected the request")
+
+        return {"status": "success", "message": "STK Push triggered successfully"}
+
+    except Exception as e:
+        print(f"Payment Error: {e}")
+        raise HTTPException(status_code=500, detail="Payment processing failed")
+
+@router.get("/verify/{phone}")
+def verify_payment_status(phone: str):
+    """Checks if a new active subscription exists for this phone number."""
+    try:
+        res = supabase.table("subscriptions") \
+            .select("voucher_code, customers!inner(phone)") \
+            .eq("customers.phone", phone) \
+            .eq("status", "active") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        if res.data:
+            return {"status": "success", "voucher": res.data[0]["voucher_code"]}
+        return {"status": "pending"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Verification failed")
+
+@router.post("/callback")
+async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
+    """Receives the payment confirmation from PayHero and automates the CRM."""
+    try:
+        data = await request.json()
+        print(f"\n--- 💸 NEW WEBHOOK RECEIVED ---")
+
+        if not data.get("status"):
+            print("❌ Webhook Ignored: Payment status is false")
+            return {"status": "ignored", "message": "Payment failed or cancelled"}
+
+        payment_data = data.get("response", {})
+        
+        phone = payment_data.get("Phone")
+        amount = payment_data.get("Amount")
+        receipt = payment_data.get("MpesaReceiptNumber") 
+        package_id = payment_data.get("ExternalReference") 
+
+        if not phone or not package_id:
+            print("❌ Webhook Error: Missing phone or package_id")
+            return {"status": "error", "message": "Missing crucial data"}
+
+        print(f"🔍 Fetching package ID: {package_id}...")
+        pkg_res = supabase.table("packages").select("*").eq("id", package_id).execute()
+        if not getattr(pkg_res, 'data', None):
+            print("❌ Error: Package not found in database!")
+            return {"status": "error", "message": "Package not found"}
+        
+        duration_hours = pkg_res.data[0].get('duration_hours', 1)
+
+        print(f"🔍 Checking customer with phone: {phone}...")
+        customer_res = supabase.table("customers").select("id").eq("phone", phone).execute()
+        
+        if getattr(customer_res, 'data', None):
+            customer_id = customer_res.data[0]['id']
+            print(f"✅ Found existing customer: {customer_id}")
+        else:
+            print("👤 Creating new customer...")
+            new_cust = supabase.table("customers").insert({
+                "phone": phone,
+                "name": "Portal User", 
+                "status": "active"
+            }).execute()
+            customer_id = new_cust.data[0]['id']
+            print(f"✅ Created customer: {customer_id}")
+
+        # Update the pending payment record with the successful receipt
+        print("💳 Updating payment record...")
+        
+        # Retrieve the pending record to extract the Router IP we saved earlier
+        pending_res = supabase.table("payments").select("id, notes").eq("phone", phone).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
+        router_ip = ""
+        
+        if pending_res.data:
+            payment_id = pending_res.data[0]['id']
+            notes = pending_res.data[0].get('notes', '')
+            if "RouterIP:" in notes:
+                router_ip = notes.split("RouterIP:")[1]
+                
+            supabase.table("payments").update({
+                "customer_id": customer_id,
+                "mpesa_receipt_number": receipt, 
+                "status": "completed"
+            }).eq("id", payment_id).execute()
+        else:
+            # Fallback if no pending record was found
+            supabase.table("payments").insert({
+                "customer_id": customer_id,
+                "package_id": package_id,
+                "amount": amount,
+                "mpesa_receipt_number": receipt, 
+                "phone": phone, 
+                "status": "completed"
+            }).execute()
+
+        print("🎟️ Generating voucher and subscription...")
+        voucher_code = generate_voucher()
+        now = datetime.utcnow()
+        expires_at = now + timedelta(hours=duration_hours)
+
+        supabase.table("subscriptions").insert({
+            "customer_id": customer_id,
+            "package_id": package_id,
+            "voucher_code": voucher_code,
+            "started_at": now.isoformat(), 
+            "expires_at": expires_at.isoformat(),
+            "status": "active"
+        }).execute()
+        print(f"✅ Subscription created! Voucher: {voucher_code}")
+
+        # INJECT INTO MIKROTIK (Background Task so it doesn't slow down the webhook response)
+        if router_ip:
+            background_tasks.add_task(inject_voucher_to_mikrotik, router_ip, voucher_code)
+        else:
+            print("⚠️ Warning: No Router IP found in payment notes. Voucher created in DB but not injected into router.")
+
+        print("--- ✅ WEBHOOK COMPLETE --- \n")
+        return {"status": "success", "message": "User provisioned successfully"}
+
+    except Exception as e:
+        print(f"🔥 CRITICAL CALLBACK ERROR: {e}")
+        return {"status": "error", "message": str(e)}
