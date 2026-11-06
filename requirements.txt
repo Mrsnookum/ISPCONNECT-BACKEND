@@ -4,4 +4,7 @@ supabase
 python-dotenv
 httpx
 pydantic
+pydantic[email]
 passlib[bcrypt]
+email-validator
+routeros-api
