@@ -8,3 +8,4 @@ pydantic[email]
 passlib[bcrypt]
 email-validator
 routeros-api
+requests
