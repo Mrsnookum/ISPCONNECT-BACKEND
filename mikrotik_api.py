@@ -186,7 +186,7 @@ async def get_login_template():
     """Provides the raw HTML for the MikroTik to download and save as hotspot/login.html"""
     
     # UPDATE THIS TO YOUR GITHUB PAGES URL
-    frontend_url = "https://mrsnookum.github.io/ISPCONNECT"
+    frontend_url = "https://mrsnookum.github.io/ispconnect2"
     
     html_content = f"""<html>
 <head><title>Redirecting...</title>
