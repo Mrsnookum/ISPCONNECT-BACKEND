@@ -9,3 +9,4 @@ passlib[bcrypt]
 email-validator
 routeros-api
 requests
+bcrypt==4.0.1
