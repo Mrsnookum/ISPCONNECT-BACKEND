@@ -25,10 +25,19 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
     """Background task: Connects to MikroTik and creates the hotspot user."""
     print(f"🔄 Injecting voucher {voucher_code} to router {router_ip}...")
     try:
-        # Fetch the secure token generated during onboarding for this specific router
-        token_res = supabase.table("provisioning_tokens").select("token").order("created_at", desc=True).limit(1).execute()
+        # 1. DYNAMICALLY FIND THE CORRECT ROUTER BY IP
+        router_res = supabase.table("routers").select("identity").eq("ip_address", router_ip).execute()
+        if not router_res.data:
+            print(f"❌ Cannot inject: No router found in DB with IP {router_ip}")
+            return
+            
+        router_identity = router_res.data[0]["identity"]
+        
+        # 2. FETCH THE SPECIFIC TOKEN FOR THIS ROUTER
+        token_res = supabase.table("provisioning_tokens").select("token").eq("router_identity", router_identity).order("created_at", desc=True).limit(1).execute()
+        
         if not token_res.data:
-            print("❌ Cannot inject: No provisioning token found to authenticate with router.")
+            print(f"❌ Cannot inject: No provisioning token found for router {router_identity}")
             return
 
         router_password = token_res.data[0]["token"]
@@ -43,7 +52,6 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
         api = connection.get_api()
 
         # Inject the user into the local Hotspot database
-        # We set both username and password to the voucher code
         api.get_resource('/ip/hotspot/user').add(
             name=voucher_code,
             password=voucher_code,
@@ -51,7 +59,7 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
         )
         
         connection.disconnect()
-        print(f"✅ Voucher {voucher_code} successfully injected into MikroTik {router_ip}")
+        print(f"✅ Voucher {voucher_code} successfully injected into MikroTik {router_identity} ({router_ip})")
 
     except Exception as e:
         print(f"🔥 MikroTik Injection Error: {str(e)}")
@@ -60,7 +68,8 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
 def get_public_packages():
     """Fetch only active packages for the public captive portal."""
     try:
-        res = supabase.table("packages").select("*").order("price").execute()
+        # BUG FIX: Only fetch packages that you have marked as ACTIVE in the admin dashboard!
+        res = supabase.table("packages").select("*").eq("is_active", True).order("price").execute()
         return res.data or []
     except Exception as e:
         print(f"🔥 Database Error fetching packages: {e}") 
@@ -82,13 +91,12 @@ def trigger_payhero_payment(req: PaymentRequest):
         raise HTTPException(status_code=500, detail="PayHero API credentials not configured in .env")
 
     try:
-        # Store a "pending" transaction first to track the router IP for the callback
         supabase.table("payments").insert({
             "package_id": req.package_id,
             "amount": amount,
             "phone": req.phone, 
             "status": "pending",
-            "notes": f"RouterIP:{req.ip}" # We store the IP here to retrieve it during callback
+            "notes": f"RouterIP:{req.ip}" 
         }).execute()
 
         payhero_url = "https://backend.payhero.co.ke/api/v2/payments"
@@ -97,8 +105,7 @@ def trigger_payhero_payment(req: PaymentRequest):
             "Authorization": payhero_api_key 
         }
         
-        # Render automatically sets RENDER_EXTERNAL_URL. If not available, use your fallback.
-        backend_url = os.getenv("RENDER_EXTERNAL_URL", "https://ispconnect-api.onrender.com")
+        backend_url = os.getenv("RENDER_EXTERNAL_URL", "https://ispconnect-backend.onrender.com")
 
         payload = {
             "amount": amount,
@@ -106,7 +113,6 @@ def trigger_payhero_payment(req: PaymentRequest):
             "channel_id": int(payhero_channel_id),
             "provider": "m-pesa",
             "external_reference": req.package_id,
-            # UPDATE THIS: Now points dynamically to your live production server
             "callback_url": f"{backend_url}/api/portal/callback" 
         }
 
@@ -186,10 +192,8 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
             customer_id = new_cust.data[0]['id']
             print(f"✅ Created customer: {customer_id}")
 
-        # Update the pending payment record with the successful receipt
         print("💳 Updating payment record...")
         
-        # Retrieve the pending record to extract the Router IP we saved earlier
         pending_res = supabase.table("payments").select("id, notes").eq("phone", phone).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
         router_ip = ""
         
@@ -205,7 +209,6 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
                 "status": "completed"
             }).eq("id", payment_id).execute()
         else:
-            # Fallback if no pending record was found
             supabase.table("payments").insert({
                 "customer_id": customer_id,
                 "package_id": package_id,
@@ -230,7 +233,6 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
         }).execute()
         print(f"✅ Subscription created! Voucher: {voucher_code}")
 
-        # INJECT INTO MIKROTIK (Background Task so it doesn't slow down the webhook response)
         if router_ip:
             background_tasks.add_task(inject_voucher_to_mikrotik, router_ip, voucher_code)
         else:
