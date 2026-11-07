@@ -21,7 +21,7 @@ app.add_middleware(
     CORSMiddleware,
     # UPDATE THIS: Replace with your actual GitHub Pages URL (no trailing slash)
     allow_origins=["https://mrsnookum.github.io"], 
-    allow_credentials=False, # MUST be False when using "*" to prevent FastAPI from crashing on startup
+    allow_credentials=True, # Changed to True since we are specifying the exact origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
