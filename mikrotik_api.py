@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 import routeros_api
 import os
+from typing import Optional
 
 from db import supabase 
 
@@ -14,9 +15,13 @@ router = APIRouter(
     tags=["MikroTik Provisioning"]
 )
 
+# UPDATED: Made these fields Optional so FastAPI never throws a 422 error 
+# regardless of what older JS code is still cached in your browser.
 class InitRequest(BaseModel):
     identity: str
-    backend_url: str
+    backend_url: Optional[str] = None
+    ngrok_url: Optional[str] = None
+    email: Optional[str] = None
 
 @router.post("/init")
 async def init_provisioning(req: InitRequest):
@@ -32,8 +37,11 @@ async def init_provisioning(req: InitRequest):
     
     supabase.table("provisioning_tokens").insert(data).execute()
     
+    # Catch whatever URL the frontend sends and default to Render
+    actual_url = req.backend_url or req.ngrok_url or "https://ispconnect-backend.onrender.com"
+    
     command = (
-        f'/tool fetch url="{req.backend_url}/api/provision/bootstrap" '
+        f'/tool fetch url="{actual_url}/api/provision/bootstrap" '
         f'http-method=post http-header-field="Authorization: Bearer {token}" '
         f'dst-path=setup.rsc; :delay 2s; /import setup.rsc; /file remove setup.rsc'
     )
@@ -52,7 +60,7 @@ async def serve_bootstrap_script(authorization: str = Header(None)):
         raise HTTPException(status_code=403, detail="Token invalid or already used")
     
     router_identity = response.data[0]['router_identity']
-    backend_url = os.getenv("RENDER_EXTERNAL_URL", "https://ispconnect-api.onrender.com")
+    backend_url = os.getenv("RENDER_EXTERNAL_URL", "https://ispconnect-backend.onrender.com")
     
     rsc_script = f"""
     :log info "ISPConnect: Starting Zero-Touch Provisioning Sequence..."
@@ -185,12 +193,16 @@ async def get_all_routers():
 async def get_login_template():
     """Provides the raw HTML for the MikroTik to download and save as hotspot/login.html"""
     
-    # UPDATE THIS TO YOUR GITHUB PAGES URL
     frontend_url = "https://mrsnookum.github.io/ispconnect2"
     
-    html_content = f"""<html>
-<head><title>Redirecting...</title>
-<script>window.location.href="{frontend_url}/portal.html?mac=$(mac)&ip=$(ip)&link-login=$(link-login)";</script>
-</head><body></body></html>"""
+    # UPDATED: This automatically gives the router the exact bridge variables 
+    # we discussed earlier, ensuring the final portal redirect works perfectly.
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="0; url={frontend_url}/portal.html?login_url=$(link-login-only-esc)&routerIp=$(server-address)&mac=$(mac)">
+</head>
+<body>Redirecting to secure payment portal...</body>
+</html>"""
     
     return html_content
