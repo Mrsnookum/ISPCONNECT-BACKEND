@@ -2,6 +2,7 @@ import os
 import requests
 import string
 import random
+import uuid
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
@@ -21,7 +22,7 @@ def generate_voucher(length=6):
     chars = string.ascii_uppercase + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
-def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
+def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str, duration_seconds: int):
     """Background task: Connects to MikroTik and creates the hotspot user."""
     print(f"🔄 Injecting voucher {voucher_code} to router {router_ip}...")
     try:
@@ -52,10 +53,12 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str):
         api = connection.get_api()
 
         # Inject the user into the local Hotspot database
+        uptime_limit = f"{duration_seconds}s"
         api.get_resource('/ip/hotspot/user').add(
             name=voucher_code,
             password=voucher_code,
-            profile="default"
+            profile="default",
+            **{"limit-uptime": uptime_limit}
         )
         
         connection.disconnect()
@@ -161,7 +164,8 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
         
         phone = payment_data.get("Phone")
         amount = payment_data.get("Amount")
-        receipt = payment_data.get("MpesaReceiptNumber") 
+        raw_receipt = payment_data.get("MpesaReceiptNumber") 
+        receipt = raw_receipt if raw_receipt else f"TEST_{uuid.uuid4().hex[:8].upper()}"
         package_id = payment_data.get("ExternalReference") 
 
         if not phone or not package_id:
@@ -174,7 +178,7 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
             print("❌ Error: Package not found in database!")
             return {"status": "error", "message": "Package not found"}
         
-        duration_hours = pkg_res.data[0].get('duration_hours', 1)
+        duration_seconds = pkg_res.data[0].get('duration_seconds', 3600)
 
         print(f"🔍 Checking customer with phone: {phone}...")
         customer_res = supabase.table("customers").select("id").eq("phone", phone).execute()
@@ -221,7 +225,7 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
         print("🎟️ Generating voucher and subscription...")
         voucher_code = generate_voucher()
         now = datetime.utcnow()
-        expires_at = now + timedelta(hours=duration_hours)
+        expires_at = now + timedelta(seconds=duration_seconds)
 
         supabase.table("subscriptions").insert({
             "customer_id": customer_id,
@@ -234,7 +238,7 @@ async def payhero_callback(request: Request, background_tasks: BackgroundTasks):
         print(f"✅ Subscription created! Voucher: {voucher_code}")
 
         if router_ip:
-            background_tasks.add_task(inject_voucher_to_mikrotik, router_ip, voucher_code)
+            background_tasks.add_task(inject_voucher_to_mikrotik, router_ip, voucher_code, duration_seconds)
         else:
             print("⚠️ Warning: No Router IP found in payment notes. Voucher created in DB but not injected into router.")
 
