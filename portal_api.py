@@ -22,15 +22,21 @@ def generate_voucher(length=6):
     return ''.join(random.choice(chars) for _ in range(length))
 
 def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str, duration_seconds: int, mac_address: str = ""):
-    clean_ip = router_ip.split(":")[0] # STRIP THE PORT BEFORE DB QUERY
-    print(f"🔄 Injecting {voucher_code} into {clean_ip}...")
+    clean_ip = router_ip.split(":")[0] 
+    print(f"🔄 Preparing to inject {voucher_code}...")
     try:
-        router_res = supabase.table("routers").select("identity").eq("ip_address", clean_ip).execute()
+        # 1. SMART ROUTER LOOKUP (Handles Hotspot IP vs WAN IP mismatch)
+        router_res = supabase.table("routers").select("identity, ip_address").eq("ip_address", clean_ip).execute()
+        
         if not router_res.data:
-            print(f"❌ Cannot inject: No router found in DB with IP {clean_ip}")
-            return
-            
+            print(f"⚠️ Hotspot IP {clean_ip} not in DB. Falling back to primary registered router...")
+            router_res = supabase.table("routers").select("identity, ip_address").limit(1).execute()
+            if not router_res.data:
+                print(f"❌ Cannot inject: No routers exist in the database!")
+                return
+                
         router_identity = router_res.data[0]["identity"]
+        actual_connection_ip = router_res.data[0]["ip_address"] # This pulls 192.168.1.68
         
         token_res = supabase.table("provisioning_tokens").select("token").eq("router_identity", router_identity).order("created_at", desc=True).limit(1).execute()
         if not token_res.data:
@@ -39,8 +45,9 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str, duration_secon
 
         router_password = token_res.data[0]["token"]
         
+        print(f"🔌 Connecting to {router_identity} at actual IP {actual_connection_ip}...")
         connection = routeros_api.RouterOsApiPool(
-            clean_ip, 
+            actual_connection_ip, 
             username="ispconnect_api", 
             password=router_password, 
             plaintext_login=True
@@ -85,7 +92,7 @@ def trigger_payhero_payment(req: PaymentRequest):
     payhero_channel_id = os.getenv("PAYHERO_CHANNEL_ID")
 
     try:
-        clean_ip = req.ip.split(":")[0] if req.ip else "" # STRIP THE PORT BEFORE SAVING
+        clean_ip = req.ip.split(":")[0] if req.ip else "" 
         
         supabase.table("payments").insert({
             "package_id": req.package_id,
@@ -177,7 +184,7 @@ async def payhero_callback(request: Request):
             notes = pending_res.data[0].get('notes', '')
             if "RouterIP:" in notes:
                 raw_ip = notes.split("RouterIP:")[1].split("|")[0]
-                router_ip = raw_ip.split(":")[0] # STRIP PORT AGAIN JUST IN CASE
+                router_ip = raw_ip.split(":")[0] 
             if "MAC:" in notes:
                 mac_address = notes.split("MAC:")[1]
 
@@ -214,14 +221,11 @@ async def payhero_callback(request: Request):
             "status": "active"
         }).execute()
         print(f"🎟️ DB Sub created: {voucher_code}")
-
-        if not router_ip:
-            fallback = supabase.table("routers").select("ip_address").limit(1).execute()
-            if fallback.data:
-                router_ip = fallback.data[0]['ip_address']
                 
         if router_ip:
             inject_voucher_to_mikrotik(router_ip, voucher_code, duration_seconds, mac_address)
+        else:
+            print("❌ CRITICAL: Could not find any router IP in pending notes.")
 
         print("--- ✅ WEBHOOK COMPLETE --- \n")
         return {"status": "success"}
