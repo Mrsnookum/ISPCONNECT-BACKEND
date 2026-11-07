@@ -22,11 +22,12 @@ def generate_voucher(length=6):
     return ''.join(random.choice(chars) for _ in range(length))
 
 def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str, duration_seconds: int, mac_address: str = ""):
-    print(f"🔄 Injecting {voucher_code} into {router_ip}...")
+    clean_ip = router_ip.split(":")[0] # STRIP THE PORT BEFORE DB QUERY
+    print(f"🔄 Injecting {voucher_code} into {clean_ip}...")
     try:
-        router_res = supabase.table("routers").select("identity").eq("ip_address", router_ip).execute()
+        router_res = supabase.table("routers").select("identity").eq("ip_address", clean_ip).execute()
         if not router_res.data:
-            print(f"❌ Cannot inject: No router found in DB with IP {router_ip}")
+            print(f"❌ Cannot inject: No router found in DB with IP {clean_ip}")
             return
             
         router_identity = router_res.data[0]["identity"]
@@ -39,7 +40,7 @@ def inject_voucher_to_mikrotik(router_ip: str, voucher_code: str, duration_secon
         router_password = token_res.data[0]["token"]
         
         connection = routeros_api.RouterOsApiPool(
-            router_ip, 
+            clean_ip, 
             username="ispconnect_api", 
             password=router_password, 
             plaintext_login=True
@@ -84,12 +85,14 @@ def trigger_payhero_payment(req: PaymentRequest):
     payhero_channel_id = os.getenv("PAYHERO_CHANNEL_ID")
 
     try:
+        clean_ip = req.ip.split(":")[0] if req.ip else "" # STRIP THE PORT BEFORE SAVING
+        
         supabase.table("payments").insert({
             "package_id": req.package_id,
             "amount": amount,
             "phone": req.phone, 
             "status": "pending",
-            "notes": f"RouterIP:{req.ip}|MAC:{req.mac}" 
+            "notes": f"RouterIP:{clean_ip}|MAC:{req.mac}" 
         }).execute()
 
         payhero_url = "https://backend.payhero.co.ke/api/v2/payments"
@@ -173,7 +176,8 @@ async def payhero_callback(request: Request):
             payment_id = pending_res.data[0]['id']
             notes = pending_res.data[0].get('notes', '')
             if "RouterIP:" in notes:
-                router_ip = notes.split("RouterIP:")[1].split("|")[0]
+                raw_ip = notes.split("RouterIP:")[1].split("|")[0]
+                router_ip = raw_ip.split(":")[0] # STRIP PORT AGAIN JUST IN CASE
             if "MAC:" in notes:
                 mac_address = notes.split("MAC:")[1]
 
